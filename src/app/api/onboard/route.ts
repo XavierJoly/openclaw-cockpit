@@ -15,7 +15,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { access, readFile, writeFile, mkdir } from "fs/promises";
 import { join, dirname } from "path";
-import { gatewayCall, runCli } from "@/lib/openclaw";
+import { runCli } from "@/lib/openclaw";
 import { patchConfig } from "@/lib/gateway-config";
 import { getOpenClawBin, getOpenClawHome, getDefaultWorkspace, getGatewayUrl } from "@/lib/paths";
 import {
@@ -642,37 +642,27 @@ export async function POST(request: NextRequest) {
           steps.push("Gateway running");
         }
 
-        // 5. Scaffold workspace via CLI — `openclaw agents add main` creates
-        //    the workspace directory and all foundational files (SOUL.md,
-        //    IDENTITY.md, USER.md, AGENTS.md, TOOLS.md, MEMORY.md, etc.)
-        //    using the CLI's own templates, which stay in sync across versions.
+        // 5. Scaffold workspace via `openclaw setup --non-interactive`.
+        //    This is the official CLI command for initializing openclaw.json
+        //    and the agent workspace with all foundational files (SOUL.md,
+        //    IDENTITY.md, USER.md, AGENTS.md, TOOLS.md, MEMORY.md, etc.).
+        //    Safe to call when workspace already exists — it's a no-op.
         try {
           const workspace = await getDefaultWorkspace();
           const workspaceExists = await fileExists(join(workspace, "SOUL.md"));
           if (!workspaceExists) {
             try {
-              // Try gateway first (same pattern as agents route)
-              await gatewayCall(
-                "agents.create",
-                { name: "main", workspace },
+              await runCli(
+                ["setup", "--non-interactive", "--workspace", workspace],
                 30000,
               );
-              steps.push("Workspace scaffolded via gateway");
-            } catch {
-              // Fall back to CLI
-              try {
-                await runCli(
-                  ["agents", "add", "main", "--non-interactive", "--workspace", workspace],
-                  30000,
-                );
-                steps.push("Workspace scaffolded via CLI");
-              } catch (cliErr) {
-                steps.push(`Warning: could not scaffold workspace: ${cliErr}`);
-              }
+              steps.push("Workspace initialized");
+            } catch (setupErr) {
+              steps.push(`Warning: could not initialize workspace: ${setupErr}`);
             }
           }
         } catch (err) {
-          steps.push(`Warning: could not scaffold workspace: ${err}`);
+          steps.push(`Warning: could not initialize workspace: ${err}`);
         }
 
         return NextResponse.json({
