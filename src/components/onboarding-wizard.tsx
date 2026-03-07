@@ -153,7 +153,7 @@ const CHANNELS: ChannelDef[] = [
   },
 ];
 
-const STEP_IDS: Array<Exclude<WizardStep, "finishing">> = ["model", "channel"];
+const STEP_IDS: WizardStep[] = ["model", "channel", "finishing"];
 
 const WELL_KNOWN_MODELS: Record<ProviderId, ModelItem[]> = {
   anthropic: [
@@ -261,6 +261,9 @@ function OnboardingModelPicker({
           <TypingDots size="sm" className="text-muted-foreground" />
           <span>Loading models from {provider.label}...</span>
         </div>
+        <p className="mt-1 text-xs text-muted-foreground/50">
+          You can also pick from the default list below while models load.
+        </p>
       </div>
     );
   }
@@ -389,6 +392,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
   const modelFetchSeqRef = useRef(0);
   const pairingPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pairingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectAbortRef = useRef<AbortController | null>(null);
 
   const currentProvider = useMemo(
     () => PROVIDERS.find((entry) => entry.id === provider) || PROVIDERS[0],
@@ -422,15 +426,19 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     };
   }, []);
 
+  const [modelFetchError, setModelFetchError] = useState(false);
+
   const fetchLiveModels = useCallback(async (nextProvider: ProviderId, token: string) => {
     const seq = ++modelFetchSeqRef.current;
     setLoadingModels(true);
+    setModelFetchError(false);
 
     try {
       const res = await fetch("/api/onboard", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "list-models", provider: nextProvider, token }),
+        signal: AbortSignal.timeout(20000),
       });
       const data = await res.json();
       if (seq !== modelFetchSeqRef.current) return;
@@ -442,6 +450,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     } catch {
       if (seq === modelFetchSeqRef.current) {
         setLiveModels([]);
+        setModelFetchError(true);
       }
     } finally {
       if (seq === modelFetchSeqRef.current) {
@@ -606,9 +615,20 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     return false;
   }, []);
 
+  const cancelChannelConnect = useCallback(() => {
+    connectAbortRef.current?.abort();
+    connectAbortRef.current = null;
+    setChannelBusy(false);
+    setConnectPhase("idle");
+    setChannelResult(null);
+  }, []);
+
   const handleConnectChannel = useCallback(async () => {
     if (!currentChannel || currentChannel.setupType !== "token" || !channelToken.trim()) return;
     if (currentChannel.requiresAppToken && !channelAppToken.trim()) return;
+
+    const abort = new AbortController();
+    connectAbortRef.current = abort;
 
     setChannelBusy(true);
     setChannelResult(null);
@@ -623,6 +643,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ channel: currentChannel.id, token: channelToken.trim() }),
+        signal: abort.signal,
       });
       const valData = await valRes.json();
       if (valData.ok === false) {
@@ -630,6 +651,8 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
       }
       if (valData.botName) setBotName(valData.botName);
       if (valData.botUsername) setBotUsername(valData.botUsername);
+
+      if (abort.signal.aborted) return;
 
       // Phase 2: Save config
       setConnectPhase("saving");
@@ -642,17 +665,21 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
           token: channelToken.trim(),
           ...(currentChannel.requiresAppToken ? { appToken: channelAppToken.trim() } : {}),
         }),
+        signal: abort.signal,
       });
       const data = await res.json();
       if (!res.ok || data.ok === false) {
         throw new Error(data.error || `Could not connect ${currentChannel.label}.`);
       }
 
+      if (abort.signal.aborted) return;
+
       // Phase 3: Wait for gateway restart and channel readiness
       setConnectPhase("restarting");
       const healthy = await waitForGatewayHealth(currentChannel.id);
+      if (abort.signal.aborted) return;
       if (!healthy) {
-        throw new Error("Gateway did not come back online. Check the logs.");
+        throw new Error("The gateway is taking longer than expected to restart. You can try again or check that the gateway is running.");
       }
 
       setConnectPhase("ready");
@@ -669,13 +696,15 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
         setPairingTimeout(true);
       }, 120000);
     } catch (error) {
+      if (abort.signal.aborted) return;
       setConnectPhase("idle");
       setChannelResult({
         type: "error",
         message: error instanceof Error ? error.message : `Could not connect ${currentChannel.label}.`,
       });
     } finally {
-      setChannelBusy(false);
+      if (!abort.signal.aborted) setChannelBusy(false);
+      connectAbortRef.current = null;
     }
   }, [channelAppToken, channelToken, currentChannel, waitForGatewayHealth]);
 
@@ -742,7 +771,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     void runQuickSetup();
   }, [runQuickSetup]);
 
-  const visibleStepIndex = step === "model" ? 0 : step === "channel" ? 1 : 1;
+  const visibleStepIndex = step === "model" ? 0 : step === "channel" ? 1 : 2;
   const continueDisabled = !apiKey.trim() || testingKey || keyValid !== true || status?.installed === false;
   const onboardingBlocked = status?.installed === false;
   const approvalComplete = approvedCodes.size > 0;
@@ -758,36 +787,50 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
             <p className="mt-1 text-sm text-muted-foreground">This only takes a minute.</p>
           </div>
 
+          <div className="mb-6 flex items-center justify-center gap-2 sm:mb-6">
+            {STEP_IDS.map((stepId, index) => {
+              const isCurrent = index === visibleStepIndex;
+              const isPast = index < visibleStepIndex;
+
+              if (isCurrent) {
+                return <span key={stepId} className="h-1.5 w-6 rounded-full bg-foreground transition-all duration-300" />;
+              }
+
+              if (isPast) {
+                // Don't allow navigating back during finishing step
+                if (step === "finishing") {
+                  return <span key={stepId} className="h-1.5 w-1.5 rounded-full bg-foreground/40 transition-all duration-300" />;
+                }
+                return (
+                  <button
+                    key={stepId}
+                    type="button"
+                    onClick={() => setStep(stepId)}
+                    className="h-1.5 w-1.5 cursor-pointer rounded-full bg-foreground/40 transition-all duration-300"
+                    aria-label={`Go back to ${stepId}`}
+                  />
+                );
+              }
+
+              return <span key={stepId} className="h-1.5 w-1.5 rounded-full bg-foreground/10 transition-all duration-300" />;
+            })}
+          </div>
           {step !== "finishing" && (
-            <div className="mb-6 flex items-center justify-center gap-2 sm:mb-6">
-              {STEP_IDS.map((stepId, index) => {
-                const isCurrent = index === visibleStepIndex;
-                const isPast = index < visibleStepIndex;
-
-                if (isCurrent) {
-                  return <span key={stepId} className="h-1.5 w-6 rounded-full bg-foreground transition-all duration-300" />;
-                }
-
-                if (isPast) {
-                  return (
-                    <button
-                      key={stepId}
-                      type="button"
-                      onClick={() => setStep(stepId)}
-                      className="h-1.5 w-1.5 cursor-pointer rounded-full bg-foreground/40 transition-all duration-300"
-                      aria-label={`Go back to ${stepId}`}
-                    />
-                  );
-                }
-
-                return <span key={stepId} className="h-1.5 w-1.5 rounded-full bg-foreground/10 transition-all duration-300" />;
-              })}
-            </div>
+            <p className="mb-4 text-center text-xs text-muted-foreground/40">
+              Step {visibleStepIndex + 1} of {STEP_IDS.length}
+            </p>
           )}
 
           {onboardingBlocked && (
-            <div className="mb-4 w-full rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-xs text-red-400">
-              OpenClaw is not installed yet. Install the OpenClaw binary first, then return to finish setup.
+            <div className="mb-4 w-full rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-xs text-red-400 space-y-2">
+              <p>OpenClaw is not installed yet. Install it first, then refresh this page.</p>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="rounded-full border border-red-500/30 px-3 py-1 text-xs text-red-300 transition-colors hover:bg-red-500/10"
+              >
+                Refresh and retry
+              </button>
             </div>
           )}
 
@@ -829,11 +872,11 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                     <p className="text-xs font-medium text-foreground/80">
                       How to get your {currentProvider.label} API key
                     </p>
-                    <div className="space-y-1 text-xs leading-relaxed text-muted-foreground">
+                    <ol className="list-decimal list-inside space-y-1 text-xs leading-relaxed text-muted-foreground">
                       {currentProvider.helpSteps.map((stepText, index) => (
-                        <p key={`${currentProvider.id}-help-${index}`}>{stepText}</p>
+                        <li key={`${currentProvider.id}-help-${index}`}>{stepText}</li>
                       ))}
-                    </div>
+                    </ol>
                     {currentProvider.helpUrl ? (
                       <a
                         href={currentProvider.helpUrl}
@@ -855,7 +898,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       <div className="group relative inline-flex items-center">
                         <ShieldCheck className="h-3 w-3 text-emerald-500/60" />
                         <div className="pointer-events-none absolute bottom-full left-1/2 mb-2 -translate-x-1/2 rounded-lg bg-foreground px-3 py-1.5 text-xs text-background opacity-0 transition-opacity group-hover:opacity-100">
-                          Encrypted and stored locally. Not even we can see it.
+                          Stored securely on this machine. Never sent to external servers.
                         </div>
                       </div>
                     </div>
@@ -891,6 +934,11 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                     {keyValid === false && keyError ? (
                       <p className="text-xs text-red-400">{keyError}</p>
                     ) : null}
+                    {apiKey.trim().length > 0 && apiKey.trim().length < 8 && !testingKey && keyValid === null ? (
+                      <p className="text-xs text-muted-foreground/50">
+                        Keep typing — API keys are usually longer (starts with {currentProvider.placeholder})
+                      </p>
+                    ) : null}
                   </div>
 
                   <div className="space-y-2">
@@ -903,6 +951,17 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       liveModels={liveModels}
                       loading={loadingModels}
                     />
+                    {modelFetchError && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (keyValid && apiKey.trim()) void fetchLiveModels(provider, apiKey.trim());
+                        }}
+                        className="text-xs text-amber-400 transition-colors hover:text-amber-300"
+                      >
+                        Could not load models from provider — using defaults. Click to retry.
+                      </button>
+                    )}
                     <p className="text-xs text-muted-foreground/50">
                       You can change this later in the Models section.
                     </p>
@@ -920,7 +979,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           : "bg-primary text-primary-foreground hover:opacity-90",
                       )}
                     >
-                      Continue
+                      Save &amp; Continue
                       <ChevronRight className="h-3.5 w-3.5" />
                     </button>
                   </div>
@@ -934,9 +993,11 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                     <p className="mt-1 text-xs text-muted-foreground">
                       Connect a channel so your agent can chat. You can skip this for now.
                     </p>
-                    <p className="mt-1.5 text-xs text-muted-foreground/80">
-                      Telegram and Discord are built-in. If setup fails, ensure OpenClaw is up to date and the gateway is running; see the Channels docs for your channel.
-                    </p>
+                    {status?.gatewayRunning === false && (
+                      <div className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                        The gateway is not running. Channel setup requires a running gateway — it will be started automatically when you finish setup, or you can start it manually first.
+                      </div>
+                    )}
                   </div>
 
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -1034,8 +1095,17 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           ) : "Connect"}
                         </button>
                       </div>
+                      {channelBusy && (
+                        <button
+                          type="button"
+                          onClick={cancelChannelConnect}
+                          className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                        >
+                          Cancel
+                        </button>
+                      )}
                       {channelResult?.type === "error" ? (
-                        <p className="text-xs text-red-400">Error: {channelResult.message}</p>
+                        <p className="text-xs text-red-400">{channelResult.message}</p>
                       ) : null}
                     </div>
                   )}
@@ -1112,11 +1182,18 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                     <button
                       type="button"
                       onClick={() => {
+                        if (pairingTimeoutRef.current) clearTimeout(pairingTimeoutRef.current);
+                        pairingTimeoutRef.current = null;
+                        setPairingRequests([]);
+                        setPairingTimeout(false);
+                        setConnectedChannel(null);
                         setSelectedChannel(null);
                         setChannelToken("");
                         setChannelAppToken("");
                         setChannelResult(null);
                         setConnectPhase("idle");
+                        setBotName("");
+                        setBotUsername("");
                         setStep("model");
                       }}
                       disabled={channelBusy}
@@ -1141,7 +1218,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       )}
                     >
                       <SkipForward className="h-3.5 w-3.5" />
-                      Skip
+                      Skip channel setup
                     </button>
                   </div>
                 </div>
@@ -1180,8 +1257,10 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                     <div>
                       <p className="text-xs font-medium text-foreground/80">Now test the connection</p>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        Open {connectedChannelDef.label} and send a message to your bot.
-                        You will receive a pairing code — then confirm it here.
+                        Open {connectedChannelDef.label} and send any message (like &quot;hi&quot;) to your bot
+                        {connectedChannel === "telegram" && botUsername ? ` (@${botUsername})` : ""}.
+                        The bot will reply with an 8-character pairing code — come back here and click <strong>Confirm &amp; Approve</strong> to activate the connection.
+                        Codes expire after 1 hour.
                       </p>
                     </div>
 
@@ -1195,10 +1274,13 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           </span>
                         </div>
                         {pairingTimeout && (
-                          <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-300">
-                            No pairing request detected yet. Make sure you sent a message to the correct bot
-                            {connectedChannel === "telegram" && botUsername ? ` (@${botUsername})` : ""}.
-                            {" "}If the problem persists, go back and re-enter the token.
+                          <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-300 space-y-1">
+                            <p className="font-medium">No pairing request detected yet.</p>
+                            <ul className="list-inside list-disc space-y-0.5 text-amber-300/80">
+                              <li>Open {connectedChannelDef.label} and send a message to your bot{connectedChannel === "telegram" && botUsername ? ` (@${botUsername})` : ""}</li>
+                              <li>Make sure you&apos;re messaging the correct bot, not a group</li>
+                              <li>If the problem persists, go back and re-enter the token</li>
+                            </ul>
                           </div>
                         )}
                         {pairingError && (
@@ -1280,7 +1362,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           : "bg-primary text-primary-foreground hover:opacity-90",
                       )}
                     >
-                      Continue
+                      Finish setup
                       <ChevronRight className="h-3.5 w-3.5" />
                     </button>
                   </div>
@@ -1292,7 +1374,12 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                   {!launchError ? (
                     <div className="flex flex-col items-center justify-center gap-4 text-center">
                       <TypingDots size="lg" className="text-muted-foreground" />
-                      <p className="text-sm text-muted-foreground">Setting up your agent...</p>
+                      <div>
+                        <p className="text-sm text-muted-foreground">Setting up your agent...</p>
+                        <p className="mt-1 text-xs text-muted-foreground/50">
+                          Saving credentials, configuring model, and starting the gateway. This may take 20–30 seconds.
+                        </p>
+                      </div>
                     </div>
                   ) : (
                     <div className="mx-auto flex max-w-sm flex-col items-center gap-3 text-center">
@@ -1332,15 +1419,15 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       onClick={() => setShowSkipConfirm(true)}
                       className="text-xs text-muted-foreground/40 transition-colors hover:text-muted-foreground"
                     >
-                      Skip setup and configure manually
+                      I prefer to configure manually
                     </button>
                   ) : (
                     <div className="mx-auto max-w-sm rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
                       <p className="text-xs font-medium text-foreground">Are you sure?</p>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        Skipping means you&apos;ll need to configure everything manually using the
-                        terminal. You&apos;ll need to set API keys, models, and start the gateway
-                        yourself via the command line.
+                        You&apos;ll need to set up API keys, choose a model, and start the gateway
+                        yourself using the command line. You can always come back to the app
+                        settings later to configure everything through the UI instead.
                       </p>
                       <div className="mt-3 flex items-center justify-center gap-3">
                         <button
@@ -1348,7 +1435,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           onClick={() => setShowSkipConfirm(false)}
                           className="rounded-full border border-border px-4 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
                         >
-                          Go back
+                          Continue setup
                         </button>
                         <button
                           type="button"
@@ -1358,7 +1445,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                           }}
                           className="rounded-full bg-amber-600 px-4 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
                         >
-                          Skip anyway
+                          Skip for now
                         </button>
                       </div>
                     </div>

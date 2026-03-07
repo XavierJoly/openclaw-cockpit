@@ -184,14 +184,14 @@ async function probeCustomEndpoint(
     });
 
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: "Authentication required — provide an API key." };
+      return { ok: false, error: "This API key was not accepted. Double-check that it is correct and has not expired." };
     }
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
       return {
         ok: false,
-        error: `Endpoint returned ${res.status}${errBody ? `: ${errBody.slice(0, 200)}` : ""}`,
+        error: `The endpoint could not be reached (status ${res.status}).${errBody ? ` Details: ${errBody.slice(0, 200)}` : ""} Make sure the URL is correct and the server is running.`,
       };
     }
 
@@ -439,8 +439,14 @@ export async function POST(request: NextRequest) {
           }
           return NextResponse.json({ ok: true });
         } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const friendly = errMsg.includes("EACCES")
+            ? "Permission denied — the app cannot write to the config directory. Check folder permissions."
+            : errMsg.includes("ENOSPC")
+              ? "No disk space left. Free up some space and try again."
+              : `Could not save credentials. ${errMsg}`;
           return NextResponse.json(
-            { ok: false, error: `Failed to save credentials: ${err}` },
+            { ok: false, error: friendly },
             { status: 500 },
           );
         }
@@ -551,8 +557,12 @@ export async function POST(request: NextRequest) {
           }
           steps.push(`Authenticated ${provider}`);
         } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const friendly = errMsg.includes("EACCES")
+            ? "Permission denied — cannot write configuration files. Check folder permissions."
+            : `Could not save authentication settings. ${errMsg}`;
           return NextResponse.json(
-            { ok: false, error: `Failed to write auth profile: ${err}`, steps },
+            { ok: false, error: friendly, steps },
             { status: 500 },
           );
         }
@@ -593,10 +603,10 @@ export async function POST(request: NextRequest) {
             await runCli(["gateway", "start"], 25000);
             steps.push("Gateway started");
 
-            // Health check retries: 5 × 1s
+            // Health check retries: 10 × 1.5s (up to 15s total)
             let running = false;
-            for (let i = 0; i < 5; i++) {
-              await new Promise((r) => setTimeout(r, 1000));
+            for (let i = 0; i < 10; i++) {
+              await new Promise((r) => setTimeout(r, 1500));
               const check = await checkGatewayHealth(gatewayUrl);
               if (check.running) {
                 running = true;
@@ -604,7 +614,7 @@ export async function POST(request: NextRequest) {
               }
             }
             if (!running) {
-              steps.push("Warning: gateway started but health check not responding yet");
+              steps.push("Gateway started but still initializing — it may need a few more seconds");
             } else {
               steps.push("Gateway running");
             }
