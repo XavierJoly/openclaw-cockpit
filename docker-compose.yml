@@ -1,0 +1,23 @@
+services:
+  cockpit:
+    build: .
+    container_name: openclaw-cockpit
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${COCKPIT_PORT:-3333}:3333"
+    environment:
+      - OPENCLAW_HOME=/openclaw-data
+      - OPENCLAW_GATEWAY_URL=http://host.docker.internal:${OPENCLAW_PORT:-60105}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - NODE_ENV=production
+    volumes:
+      - ${OPENCLAW_DATA_PATH:-/docker/openclaw-rdvm/data}:/openclaw-data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.cockpit.rule=Host(`cockpit.${TRAEFIK_HOST}`)"
+      - "traefik.http.routers.cockpit.entrypoints=websecure"
+      - "traefik.http.routers.cockpit.tls.certresolver=letsencrypt"
+      - "traefik.http.services.cockpit.loadbalancer.server.port=3333"
