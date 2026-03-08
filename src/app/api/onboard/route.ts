@@ -15,6 +15,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { access, readFile, writeFile, mkdir } from "fs/promises";
 import { join, dirname } from "path";
+import { randomBytes } from "crypto";
 import { runCli } from "@/lib/openclaw";
 import { patchConfig } from "@/lib/gateway-config";
 import { getOpenClawBin, getOpenClawHome, getDefaultWorkspace, getGatewayUrl } from "@/lib/paths";
@@ -594,12 +595,21 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // 3. Set gateway mode to local and explicitly set auth mode to token
-        //    (v2026.3.7+ requires explicit gateway.auth.mode when both token
-        //    and password are configured — setting it upfront prevents breakage)
+        // 3. Set gateway mode to local and explicitly set auth mode to token.
+        //    v2026.3.7+ requires explicit gateway.auth.mode when both token
+        //    and password are configured — setting it upfront prevents breakage.
+        //    Also ensure a token exists, since the gateway refuses to start
+        //    with mode:"token" but no token configured.
         try {
           await ensureConfigValue(home, "gateway.mode", "local");
           await ensureConfigValue(home, "gateway.auth.mode", "token");
+          const configPath = join(home, "openclaw.json");
+          const cfg = (await readJsonSafe<Record<string, unknown>>(configPath)) || {};
+          const existingToken = getDotPath(cfg, "gateway.auth.token");
+          if (!existingToken || typeof existingToken !== "string" || !existingToken.trim()) {
+            await ensureConfigValue(home, "gateway.auth.token", randomBytes(24).toString("hex"));
+            steps.push("Gateway auth token generated");
+          }
         } catch {
           // non-fatal
         }
