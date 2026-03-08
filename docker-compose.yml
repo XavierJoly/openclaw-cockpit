@@ -7,7 +7,7 @@ services:
     ports:
       - "${COCKPIT_PORT:-3333}:3333"
     environment:
-      - OPENCLAW_HOME=/openclaw-data
+      - OPENCLAW_HOME=/openclaw-data/.openclaw
       - OPENCLAW_GATEWAY_URL=http://host.docker.internal:${OPENCLAW_PORT:-60105}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - NODE_ENV=production
